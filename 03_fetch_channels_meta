@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+03_fetch_channels_meta.py
+
+═══════════════════════════════════════════════════════════════
+이 스크립트가 하는 일
+═══════════════════════════════════════════════════════════════
+02_videos_meta.csv에서 수집된 고유 channel_id를 이용하여
+YouTube Data API v3의 channels.list 엔드포인트를 호출하고
+채널 메타데이터를 수집합니다.
+
+이 단계가 연구에서 중요한 이유:
+  - channel_created_at: 채널이 정책 전/후에 만들어진 채널인지 구분
+    → 풍선효과 식별의 핵심 변수
+    → "채널 수 증가"가 기존 채널의 자연 성장인지
+       정책 회피를 위한 신규 채널 생성인지 분리 가능
+  - subscriber_count: 채널 규모 통제변수
+  - channel_video_count: platform-one-shot 판별
+    (표본 내가 아니라 YouTube 전체에서 업로드가 적은 채널)
+
+입력 파일: 02_videos_meta.csv
+출력 파일: 03_channels_meta.csv
+           03_completed_batches.txt
+
+═══════════════════════════════════════════════════════════════
+수집 컬럼
+═══════════════════════════════════════════════════════════════
+channel_id          : 채널 식별자
+channel_title       : 채널명
+channel_created_at  : 채널 생성일 → 풍선효과 분석 핵심 변수
+subscriber_count    : 구독자 수 → 채널 규모 통제변수
+channel_video_count : 채널 전체 영상 수 → platform-one-shot 판별
+uploads_playlist_id : 업로드 플레이리스트 ID → STEP 4 입력값
+
+═══════════════════════════════════════════════════════════════
+Resume 방식
+═══════════════════════════════════════════════════════════════
+02단계와 동일하게 배치 단위로 완료를 기록합니다.
+완료된 배치는 API 요청 없이 건너뜁니다.
+API 키를 교체해도 완료된 배치는 재수집하지 않습니다.
+
+═══════════════════════════════════════════════════════════════
+API 키 설정
+═══════════════════════════════════════════════════════════════
+코드 상단 API_KEY 변수에 입력하거나
+--api-key 인자로 전달하세요.
+
+쿼터 비용: channels.list 1회 = 1 unit (50개 배치당 1 unit)
+예상 총 쿼터: 채널 약 4,000개 기준 → 약 80 units (매우 저렴)
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Set
+
+import pandas as pd
+import requests
+
+
+# ═══════════════════════════════════════════════════════════════
+# 설정값
+# ═══════════════════════════════════════════════════════════════
+
+API_URL = "https://www.googleapis.com/youtube/v3/channels"
+
+# ✅ 여기에 YouTube Data API 키를 입력하세요
+API_KEY = "KEY"
+
+DEFAULT_INPUT             = "data/02_videos_meta.csv"
+DEFAULT_OUTPUT            = "data/03_channels_meta.csv"
+DEFAULT_COMPLETED_BATCHES = "data/03_completed_batches.txt"
+
+BATCH_SIZE = 50
+
+# 출력 컬럼
+OUTPUT_COLUMNS = [
+    "channel_id",           # 채널 식별자
+    "channel_title",        # 채널명
+    "channel_created_at",   # 채널 생성일 → 풍선효과 분석 핵심
+    "subscriber_count",     # 구독자 수 → 채널 규모 통제변수
+    "channel_video_count",  # 채널 전체 영상 수 → platform-one-shot
+    "uploads_playlist_id",  # 업로드 플레이리스트 ID → STEP 4 입력값
+    "collected_at_utc",     # 수집 시각
+]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 커맨드라인 인자
+# ═══════════════════════════════════════════════════════════════
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "02_videos_meta.csv의 channel_id로 채널 메타데이터를 수집합니다.\n"
+            "channel_created_at이 풍선효과 분석의 핵심 변수입니다.\n"
+            "\n"
+            "Resume 방식: 완료된 배치는 API 요청 없이 건너뜁니다."
+        )
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=API_KEY,
+        help="YouTube Data API 키",
+    )
+    parser.add_argument(
+        "--input",
+        type=str,
+        default=DEFAULT_INPUT,
+        help=f"입력 CSV 파일 (기본값: {DEFAULT_INPUT})",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=DEFAULT_OUTPUT,
+        help=f"출력 CSV 파일 (기본값: {DEFAULT_OUTPUT})",
+    )
+    parser.add_argument(
+        "--completed-batches",
+        type=str,
+        default=DEFAULT_COMPLETED_BATCHES,
+        help=f"완료된 배치 기록 파일 (기본값: {DEFAULT_COMPLETED_BATCHES})",
+    )
+    parser.add_argument(
+        "--sleep-seconds",
+        type=float,
+        default=0.05,
+        help="API 요청 간 대기 시간(초) (기본값: 0.05)",
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        default=False,
+        help="처음부터 다시 수집 (기존 출력 파일 삭제)",
+    )
+    return parser.parse_args()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 입력값 검증
+# ═══════════════════════════════════════════════════════════════
+
+def validate_args(args: argparse.Namespace) -> None:
+    if not args.api_key or args.api_key == "여기에_API_키_입력":
+        raise ValueError(
+            "\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "❌ API 키가 설정되지 않았습니다.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "방법 1. 코드 상단 API_KEY 변수에 직접 입력:\n"
+            '  API_KEY = "AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"\n'
+            "\n"
+            "방법 2. 커맨드라인 인자로 전달:\n"
+            '  python 03_fetch_channels_meta.py --api-key "AIzaSyXXXX..."\n'
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+    if not os.path.exists(args.input):
+        raise FileNotFoundError(
+            f"입력 파일을 찾을 수 없습니다: {args.input}\n"
+            "02_fetch_videos_meta.py를 먼저 실행하세요."
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+# 입력 데이터 로드
+# ═══════════════════════════════════════════════════════════════
+
+def load_channel_ids(input_path: str) -> List[str]:
+    """
+    02_videos_meta.csv에서 고유 channel_id 목록을 추출합니다.
+
+    is_ai_cover=1인 영상의 채널만 수집합니다.
+    (분석 표본에 포함되는 채널만 필요)
+    """
+    df = pd.read_csv(input_path, low_memory=False)
+
+    # is_ai_cover=1인 채널만
+    ai_df = df[df['is_ai_cover'] == 1]
+    channel_ids = sorted(ai_df['channel_id'].dropna().unique().tolist())
+
+    print(f"[INFO] 전체 영상 수       : {len(df):,}")
+    print(f"[INFO] AI Cover 영상 수   : {len(ai_df):,}")
+    print(f"[INFO] 고유 channel_id 수 : {len(channel_ids):,}")
+
+    return channel_ids
+
+
+# ═══════════════════════════════════════════════════════════════
+# 완료된 배치 관리
+# ═══════════════════════════════════════════════════════════════
+
+def load_completed_batches(filepath: str) -> Set[int]:
+    """
+    03_completed_batches.txt에서 완료된 배치 번호를 로드합니다.
+    완료된 배치는 API 요청 없이 건너뜁니다.
+    """
+    completed: Set[int] = set()
+    if not os.path.exists(filepath):
+        return completed
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            val = line.strip()
+            if val.isdigit():
+                completed.add(int(val))
+    return completed
+
+
+def mark_batch_completed(filepath: str, batch_idx: int) -> None:
+    """배치가 정상 완료됐을 때 기록합니다."""
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(f"{batch_idx}\n")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 파일 초기화
+# ═══════════════════════════════════════════════════════════════
+
+def reset_output_files(output_path: str, completed_path: str) -> None:
+    for path in [output_path, completed_path]:
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"[RESET] 삭제됨: {path}")
+
+
+def ensure_csv_header(output_path: str) -> None:
+    if os.path.exists(output_path):
+        return
+    with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS)
+        writer.writeheader()
+
+
+# ═══════════════════════════════════════════════════════════════
+# API 요청
+# ═══════════════════════════════════════════════════════════════
+
+def request_channels_batch(
+    api_key: str,
+    channel_ids: List[str],
+    session: Optional[requests.Session] = None,
+) -> Dict:
+    """
+    channels.list API를 호출합니다.
+
+    수집 part:
+      - snippet        : title, publishedAt (채널 생성일)
+      - statistics     : subscriberCount, videoCount
+      - contentDetails : relatedPlaylists.uploads (업로드 플레이리스트 ID)
+    """
+    params = {
+        "key":        api_key,
+        "part":       "snippet,statistics,contentDetails",
+        "id":         ",".join(channel_ids),
+        "maxResults": len(channel_ids),
+    }
+    requester = session or requests
+    response  = requester.get(API_URL, params=params, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 응답 파싱
+# ═══════════════════════════════════════════════════════════════
+
+def parse_channel_items(items: List[Dict]) -> List[Dict]:
+    """
+    channels.list 응답을 파싱합니다.
+
+    channel_created_at (snippet.publishedAt):
+      채널이 만들어진 날짜입니다.
+      정책 기준일과 비교하여 신규 채널 여부를 판별합니다.
+      - channel_created_at > 2024-03-18 → 정책1 이후 신규 채널
+      - channel_created_at > 2025-07-15 → 정책2 이후 신규 채널
+      이 변수가 풍선효과 분석의 핵심입니다.
+
+    channel_video_count (statistics.videoCount):
+      채널 전체(YouTube 전반)의 업로드 영상 수입니다.
+      표본 내 AI Cover 영상이 1개인 채널이라도
+      YouTube 전체에서 많은 영상을 올린 채널일 수 있습니다.
+      channel_video_count <= 5이면 platform-one-shot으로 분류합니다.
+    """
+    collected_at_utc = datetime.now(timezone.utc).isoformat()
+    rows: List[Dict] = []
+
+    for item in items:
+        channel_id       = item.get("id", "")
+        snippet          = item.get("snippet", {}) or {}
+        statistics       = item.get("statistics", {}) or {}
+        content_details  = item.get("contentDetails", {}) or {}
+        related_playlists = content_details.get("relatedPlaylists", {}) or {}
+
+        # 구독자 수: hiddenSubscriberCount=True인 경우 0으로 처리
+        sub_count = statistics.get("subscriberCount")
+        sub_count = int(sub_count) if sub_count is not None else 0
+
+        # 채널 전체 영상 수
+        vid_count = statistics.get("videoCount")
+        vid_count = int(vid_count) if vid_count is not None else 0
+
+        rows.append({
+            "channel_id":           channel_id,
+            "channel_title":        snippet.get("title", ""),
+            "channel_created_at":   snippet.get("publishedAt", ""),
+            "subscriber_count":     sub_count,
+            "channel_video_count":  vid_count,
+            "uploads_playlist_id":  related_playlists.get("uploads", ""),
+            "collected_at_utc":     collected_at_utc,
+        })
+
+    return rows
+
+
+# ═══════════════════════════════════════════════════════════════
+# CSV 저장
+# ═══════════════════════════════════════════════════════════════
+
+def append_rows(output_path: str, rows: List[Dict]) -> int:
+    if not rows:
+        return 0
+    with open(output_path, "a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS)
+        writer.writerows(rows)
+    return len(rows)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 쿼터 초과 감지
+# ═══════════════════════════════════════════════════════════════
+
+def is_quota_exceeded(exc: requests.HTTPError) -> bool:
+    try:
+        text = exc.response.text.lower()
+    except Exception:
+        text = str(exc).lower()
+    return "quotaexceeded" in text
+
+
+# ═══════════════════════════════════════════════════════════════
+# 배치 생성
+# ═══════════════════════════════════════════════════════════════
+
+def make_batches(items: List[str], batch_size: int) -> List[List[str]]:
+    return [items[i:i+batch_size] for i in range(0, len(items), batch_size)]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 메인 실행
+# ═══════════════════════════════════════════════════════════════
+
+def main() -> None:
+    args = parse_args()
+    validate_args(args)
+
+    if args.reset:
+        print("\n[RESET] 기존 파일을 삭제하고 처음부터 수집합니다.")
+        reset_output_files(args.output, args.completed_batches)
+
+    # 채널 ID 로드
+    channel_ids   = load_channel_ids(args.input)
+    batches       = make_batches(channel_ids, BATCH_SIZE)
+    total_batches = len(batches)
+
+    # 완료된 배치 로드
+    completed_batches = load_completed_batches(args.completed_batches)
+
+    # CSV 헤더 초기화
+    ensure_csv_header(args.output)
+
+    pending_count = total_batches - len(completed_batches)
+
+    print(f"\n{'═'*60}")
+    print(f"  채널 메타데이터 수집 (channels.list)")
+    print(f"{'═'*60}")
+    print(f"  수집할 채널 수       : {len(channel_ids):,}개")
+    print(f"  총 배치 수           : {total_batches:,}개 (배치당 {BATCH_SIZE}개)")
+    print(f"  이미 완료된 배치     : {len(completed_batches):,}개 → 건너뜀")
+    print(f"  이번에 수집할 배치   : {pending_count:,}개")
+    print(f"  예상 쿼터 소모       : {pending_count:,} units (매우 저렴)")
+    print(f"  입력 파일            : {args.input}")
+    print(f"  출력 파일            : {args.output}")
+    print(f"  완료 기록 파일       : {args.completed_batches}")
+    print(f"{'═'*60}\n")
+
+    # 수집 통계
+    total_requests  = 0
+    total_saved     = 0
+    total_missing   = 0
+    batches_skipped = 0
+    batches_done    = 0
+    batches_error   = 0
+
+    session = requests.Session()
+
+    try:
+        for batch_idx, batch_ids in enumerate(batches):
+
+            # ─────────────────────────────────────────────────
+            # 완료된 배치 건너뛰기 (API 요청 없음)
+            # ─────────────────────────────────────────────────
+            if batch_idx in completed_batches:
+                batches_skipped += 1
+                print(
+                    f"[BATCH {batch_idx+1:3d}/{total_batches}] "
+                    f"ids={len(batch_ids)} | ✅ SKIP"
+                )
+                continue
+
+            print(
+                f"[BATCH {batch_idx+1:3d}/{total_batches}] "
+                f"ids={len(batch_ids)}"
+            )
+
+            batch_error = False
+
+            try:
+                data = request_channels_batch(
+                    api_key     = args.api_key,
+                    channel_ids = batch_ids,
+                    session     = session,
+                )
+                total_requests += 1
+
+            except requests.HTTPError as exc:
+                status = getattr(exc.response, "status_code", "unknown")
+                print(f"  [ERROR] HTTP {status}: {exc}")
+
+                if is_quota_exceeded(exc):
+                    print(
+                        "\n  [STOP] ❌ 쿼터 초과 감지. 즉시 중단합니다.\n"
+                        "  내일 다시 실행하면 이어서 수집됩니다."
+                    )
+                    raise
+
+                batch_error = True
+
+            except requests.RequestException as exc:
+                print(f"  [ERROR] 요청 실패: {exc}")
+                batch_error = True
+
+            if batch_error:
+                batches_error += 1
+                time.sleep(args.sleep_seconds)
+                continue
+
+            # ─────────────────────────────────────────────────
+            # 응답 파싱 및 저장
+            # ─────────────────────────────────────────────────
+            items = data.get("items", [])
+
+            # API 미반환 채널 (삭제/정지된 채널)
+            returned_ids = {item.get("id", "") for item in items}
+            missing_ids  = [cid for cid in batch_ids if cid not in returned_ids]
+            total_missing += len(missing_ids)
+
+            rows  = parse_channel_items(items)
+            saved = append_rows(args.output, rows)
+            total_saved += saved
+
+            print(
+                f"  returned={len(items):3d}  "
+                f"saved={saved:3d}  "
+                f"missing={len(missing_ids):2d}"
+            )
+
+            if missing_ids:
+                print(
+                    f"  [참고] API 미반환 채널 "
+                    f"(삭제/정지 등): {missing_ids[:3]}"
+                    f"{'...' if len(missing_ids) > 3 else ''}"
+                )
+
+            # ─────────────────────────────────────────────────
+            # 배치 완료 기록
+            # ─────────────────────────────────────────────────
+            mark_batch_completed(args.completed_batches, batch_idx)
+            completed_batches.add(batch_idx)
+            batches_done += 1
+
+            time.sleep(args.sleep_seconds)
+
+    except requests.HTTPError:
+        pass
+
+    finally:
+        session.close()
+
+    # ─────────────────────────────────────────────────────────
+    # 최종 결과 출력
+    # ─────────────────────────────────────────────────────────
+    print(f"\n{'═'*60}")
+    print(f"  수집 결과")
+    print(f"{'═'*60}")
+    print(f"  총 API 요청 수       : {total_requests:,}회")
+    print(f"  저장된 채널 수       : {total_saved:,}개")
+    print(f"  API 미반환 채널      : {total_missing:,}개 (삭제/정지 등)")
+    print(f"  건너뛴 배치          : {batches_skipped:,}개 (이미 완료)")
+    print(f"  이번에 완료된 배치   : {batches_done:,}개")
+    print(f"  에러 배치            : {batches_error:,}개")
+    print(f"  출력 파일            : {args.output}")
+    print(f"{'═'*60}")
+
+    remaining = total_batches - batches_skipped - batches_done
+    if remaining > 0:
+        print(
+            f"\n  ⚠️  아직 {remaining}개 배치가 남아있습니다.\n"
+            "  다시 실행하면 이어서 수집됩니다."
+        )
+    else:
+        print(
+            "\n  🎉 모든 배치 수집 완료!\n"
+            "\n  수집 후 확인할 지표:"
+            "\n    - 정책 전/후 신규 채널 비율 (channel_created_at 기준)"
+            "\n    - platform-one-shot 채널 비율 (channel_video_count <= 5)"
+            "\n    - 채널 규모별 업로드 패턴 차이 (subscriber_count 기준)"
+            "\n\n  다음 단계: python 04_fetch_channel_uploads.py\n"
+        )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(
+            "\n[STOPPED] 사용자에 의해 중단되었습니다.\n"
+            "현재 배치는 완료 기록되지 않았으므로\n"
+            "다시 실행하면 해당 배치부터 이어서 수집됩니다."
+        )
+        sys.exit(1)
+    except Exception as exc:
+        print(f"\n[FATAL] 예상치 못한 오류: {exc}")
+        sys.exit(1)
