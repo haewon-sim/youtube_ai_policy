@@ -115,11 +115,16 @@ OUTPUT_COLUMNS = [
 ]
 
 # ═══════════════════════════════════════════════════════════════
-# AI Cover 분류 사전
+# AI Cover 분류 신호
 # ═══════════════════════════════════════════════════════════════
 
-# 포함 신호: 이 단어가 title/description/tags에 있으면 AI Cover 후보
-INCLUDE_SIGNALS = [
+INCLUDE_PATTERNS_REGEX = [
+    # ai + (선택적 단어 1~2개) + cover
+    # 예: ai cover / ai female cover / ai rap cover / ai rock energi cover
+    r"ai\s+\w*\s*\w*\s*cover",
+]
+
+INCLUDE_STRINGS = [
     "cover ai",
     "ai cover",
     "aicover",
@@ -137,11 +142,12 @@ INCLUDE_SIGNALS = [
     "ai remix",
     "using ai",
     "synthetically generated",
+    "ai song cover",
+    "ai song",
 ]
 
-# 제외 신호: 이 단어가 있으면 AI Cover 콘텐츠가 아닐 가능성이 높음
-# (튜토리얼, 리뷰, 뉴스, 반응 영상 등)
-EXCLUDE_SIGNALS = [
+
+EXCLUDE_SIGNALS_TITLE_ONLY = [
     "tutorial",
     "how to",
     "how-to",
@@ -153,6 +159,9 @@ EXCLUDE_SIGNALS = [
     "tool review",
     "how to make",
     "how to generate",
+    "how to create",
+    "how to use",
+    "step by step",
 ]
 
 
