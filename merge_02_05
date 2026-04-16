@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+merge_02_05.py
+
+02_videos_meta.csv + 05_uploads_meta.csv를 합쳐서
+data/merged_videos.csv를 생성합니다.
+
+처리 내용:
+  1. 02에서 search_window_start 컬럼 제거
+  2. 두 파일의 공통 컬럼 기준으로 합치기
+  3. video_id 기준 중복 제거 (02 우선)
+  4. 수집 기간(2023-09-01 ~ 2026-01-31) 내 데이터만 유지
+  5. 결과 저장: data/merged_videos.csv
+
+실행:
+  python merge_02_05.py
+"""
+
+import argparse
+import os
+import sys
+
+import pandas as pd
+
+# ─────────────────────────────────────────────────────────────
+# 설정
+# ─────────────────────────────────────────────────────────────
+DEFAULT_V2     = 'data/02_videos_meta.csv'
+DEFAULT_V5     = 'data/05_uploads_meta.csv'
+DEFAULT_OUTPUT = 'data/merged_videos.csv'
+
+STUDY_START = '2023-09-01'
+STUDY_END   = '2026-01-31'
+
+# 02에서 제거할 컬럼
+DROP_COLS_V2 = ['search_window_start']
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description='02_videos_meta + 05_uploads_meta 합치기'
+    )
+    p.add_argument('--v2',     default=DEFAULT_V2,     help=f'02 파일 경로 (기본: {DEFAULT_V2})')
+    p.add_argument('--v5',     default=DEFAULT_V5,     help=f'05 파일 경로 (기본: {DEFAULT_V5})')
+    p.add_argument('--output', default=DEFAULT_OUTPUT, help=f'출력 경로 (기본: {DEFAULT_OUTPUT})')
+    p.add_argument('--no-filter-date', action='store_true',
+                   help='수집 기간 필터 적용 안 함')
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # ── 파일 존재 확인 ────────────────────────────────────────
+    for path in [args.v2, args.v5]:
+        if not os.path.exists(path):
+            print(f"[ERROR] 파일을 찾을 수 없습니다: {path}")
+            sys.exit(1)
+
+    # ── 02 로드 ───────────────────────────────────────────────
+    print(f"[LOAD] {args.v2}")
+    v2 = pd.read_csv(args.v2, low_memory=False)
+    print(f"       {len(v2):,}행  컬럼: {list(v2.columns)}")
+
+    # search_window_start 제거
+    drop_v2 = [c for c in DROP_COLS_V2 if c in v2.columns]
+    if drop_v2:
+        v2 = v2.drop(columns=drop_v2)
+        print(f"       제거된 컬럼: {drop_v2}")
+
+    v2['source'] = '02'
+
+    # ── 05 로드 ───────────────────────────────────────────────
+    print(f"\n[LOAD] {args.v5}")
+    v5 = pd.read_csv(args.v5, low_memory=False)
+    print(f"       {len(v5):,}행  컬럼: {list(v5.columns)}")
+    v5['source'] = '05'
+
+    # ── 공통 컬럼 확인 ────────────────────────────────────────
+    cols_v2 = set(v2.columns)
+    cols_v5 = set(v5.columns)
+    common  = sorted(cols_v2 & cols_v5)
+    only_v2 = sorted(cols_v2 - cols_v5)
+    only_v5 = sorted(cols_v5 - cols_v2)
+
+    print(f"\n[INFO] 공통 컬럼 ({len(common)}개): {common}")
+    if only_v2:
+        print(f"[INFO] 02에만 있는 컬럼: {only_v2}")
+    if only_v5:
+        print(f"[INFO] 05에만 있는 컬럼: {only_v5}")
+
+    # 공통 컬럼 기준으로 합치기 (source 포함)
+    use_cols = common  # source는 이미 둘 다 있음
+    v2_sub = v2[use_cols].copy()
+    v5_sub = v5[use_cols].copy()
+
+    # ── concat ────────────────────────────────────────────────
+    print(f"\n[MERGE] concat 중...")
+    merged = pd.concat([v2_sub, v5_sub], ignore_index=True)
+    print(f"        합친 후: {len(merged):,}행")
+
+    # ── 중복 제거: video_id 기준, 02 우선 ─────────────────────
+    # source='02'가 위에 있으므로 keep='first' 하면 02 우선
+    before_dedup = len(merged)
+    merged = (merged
+              .sort_values('source')           # 02 < 05 알파벳순
+              .drop_duplicates(subset='video_id', keep='first')
+              .reset_index(drop=True))
+    dedup_removed = before_dedup - len(merged)
+    print(f"        중복 제거 후: {len(merged):,}행  (제거: {dedup_removed:,}개)")
+
+    # ── 수집 기간 필터 ────────────────────────────────────────
+    if not args.no_filter_date:
+        merged['published_at'] = pd.to_datetime(
+            merged['published_at'], utc=True, errors='coerce')
+        before_filter = len(merged)
+        merged = merged[
+            (merged['published_at'] >= pd.Timestamp(STUDY_START, tz='UTC')) &
+            (merged['published_at'] <= pd.Timestamp(STUDY_END,   tz='UTC'))
+        ].reset_index(drop=True)
+        filtered = before_filter - len(merged)
+        print(f"        기간 필터 후: {len(merged):,}행  "
+              f"(제거: {filtered:,}개, {STUDY_START}~{STUDY_END})")
+
+    # ── 결과 요약 ─────────────────────────────────────────────
+    print(f"\n{'='*55}")
+    print(f"  최종 행 수       : {len(merged):,}행")
+    print(f"  고유 video_id    : {merged['video_id'].nunique():,}개")
+    print(f"  고유 channel_id  : {merged['channel_id'].nunique():,}개")
+    print(f"  is_ai_cover=1    : {(merged['is_ai_cover']==1).sum():,}개 "
+          f"({(merged['is_ai_cover']==1).mean()*100:.1f}%)")
+    print(f"  is_ai_cover=0    : {(merged['is_ai_cover']==0).sum():,}개")
+    print(f"  출처 02          : {(merged['source']=='02').sum():,}개")
+    print(f"  출처 05          : {(merged['source']=='05').sum():,}개")
+    if 'published_at' in merged.columns:
+        print(f"  기간             : "
+              f"{merged['published_at'].min().date()} ~ "
+              f"{merged['published_at'].max().date()}")
+    print(f"  컬럼             : {list(merged.columns)}")
+    print(f"{'='*55}")
+
+    # ── 저장 ─────────────────────────────────────────────────
+    os.makedirs(os.path.dirname(args.output), exist_ok=True) \
+        if os.path.dirname(args.output) else None
+
+    merged.to_csv(args.output, index=False, encoding='utf-8-sig')
+    print(f"\n[SAVED] {args.output}")
+    print(f"\n다음 단계: 이 파일로 RQ1/RQ2/RQ3 분석")
+
+
+if __name__ == '__main__':
+    main()
