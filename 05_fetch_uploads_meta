@@ -1,0 +1,723 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+05_fetch_uploads_meta.py
+
+═══════════════════════════════════════════════════════════════
+이 스크립트가 하는 일
+═══════════════════════════════════════════════════════════════
+04_channel_uploads.csv에서 수집된 video_id를 이용하여
+YouTube Data API v3의 videos.list 엔드포인트를 호출하고
+각 영상의 메타데이터를 수집한 뒤 AI Cover 여부를 분류합니다.
+
+이 단계가 연구에서 중요한 이유:
+  채널 전체 업로드 중 AI Cover를 정확히 식별해야
+  아래 지표를 계산할 수 있습니다.
+
+  [생존율/이탈율/전환율]
+    - 생존: 정책 후에도 AI Cover 업로드 지속
+    - 전환: AI Cover 중단, 다른 콘텐츠 지속
+    - 이탈: 업로드 자체 중단
+
+  [업로드 빈도 변화]
+    - 채널별 정책 전/후 AI Cover 업로드 수 비교
+    - heavy uploader 채널의 행동 변화 (treatment intensity)
+
+  [풍선효과 완성]
+    - 기존 채널 AI Cover 감소 + 신규 채널 AI Cover 증가 패턴
+
+입력 파일: data/04_channel_uploads.csv
+           data/02_videos_meta.csv  (이미 수집된 video_id 중복 방지용)
+출력 파일: data/05_uploads_meta.csv
+           data/05_completed_batches.txt
+
+═══════════════════════════════════════════════════════════════
+중복 수집 방지
+═══════════════════════════════════════════════════════════════
+02_videos_meta.csv에 이미 있는 video_id는 수집하지 않습니다.
+(STEP 2에서 이미 수집된 영상은 메타데이터가 있으므로 재호출 불필요)
+→ API 쿼터 절약
+
+최종 분석 시에는 02_videos_meta.csv + 05_uploads_meta.csv를
+합쳐서 사용합니다.
+
+═══════════════════════════════════════════════════════════════
+Resume 방식
+═══════════════════════════════════════════════════════════════
+02단계와 동일하게 배치 단위로 완료를 기록합니다.
+완료된 배치는 API 요청 없이 건너뜁니다.
+API 키를 교체해도 완료된 배치는 재수집하지 않습니다.
+
+═══════════════════════════════════════════════════════════════
+API 키 설정
+═══════════════════════════════════════════════════════════════
+코드 상단 API_KEY 변수에 입력하거나
+--api-key 인자로 전달하세요.
+
+쿼터 비용: videos.list 1회 = 1 unit (50개 배치당 1 unit)
+예상: 신규 video_id 수 / 50 units
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Set
+
+import pandas as pd
+import requests
+
+
+# ═══════════════════════════════════════════════════════════════
+# 설정값
+# ═══════════════════════════════════════════════════════════════
+
+API_URL = "https://www.googleapis.com/youtube/v3/videos"
+
+# ✅ 여기에 YouTube Data API 키를 입력하세요
+API_KEY = "KEY"
+
+DEFAULT_INPUT_UPLOADS   = "data/04_channel_uploads.csv"
+DEFAULT_INPUT_EXISTING  = "data/02_videos_meta.csv"
+DEFAULT_OUTPUT          = "data/05_uploads_meta_2.csv"
+DEFAULT_COMPLETED       = "data/05_completed_batches.txt"
+
+BATCH_SIZE = 50
+
+# 정책 기준일
+POLICY1_DATE = datetime(2024, 3, 18, tzinfo=timezone.utc)
+POLICY2_DATE = datetime(2025, 7, 15, tzinfo=timezone.utc)
+
+# 출력 컬럼
+OUTPUT_COLUMNS = [
+    "video_id",
+    "channel_id",
+    "published_at",
+    "video_title",
+    "video_description",
+    "video_tags",
+    "duration_sec",
+    "view_count",
+    "like_count",
+    "is_ai_cover",
+    "week_start_date",
+    "weeks_from_policy1",
+    "weeks_from_policy2",
+    "collected_at_utc",
+]
+
+
+# ═══════════════════════════════════════════════════════════════
+# AI Cover 분류 신호
+# ═══════════════════════════════════════════════════════════════
+
+INCLUDE_PATTERNS_REGEX = [
+    # ai + (선택적 단어 1~2개) + cover
+    # 예: ai cover / ai female cover / ai rap cover / ai rock energi cover
+    r"ai\s+\w*\s*\w*\s*cover",
+]
+
+INCLUDE_STRINGS = [
+    "cover ai",
+    "ai cover",
+    "aicover",
+    "coverai",
+    "kpop cover",
+    "ai커버",
+    "ai 커버",
+    "generated using ai",
+    "ai ver",
+    "ai version",
+    "ai generated",
+    "ai vocal",
+    "ai singing",
+    "ai vocals",
+    "ai remix",
+    "using ai",
+    "synthetically generated",
+    "ai song cover",
+    "ai song",
+]
+
+
+EXCLUDE_SIGNALS_TITLE_ONLY = [
+    "tutorial",
+    "how to",
+    "how-to",
+    "review",
+    "reaction",
+    "reacting",
+    "news",
+    "guide",
+    "tool review",
+    "how to make",
+    "how to generate",
+    "how to create",
+    "how to use",
+    "step by step",
+]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 커맨드라인 인자
+# ═══════════════════════════════════════════════════════════════
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "04_channel_uploads.csv의 video_id로 메타데이터를 수집하고\n"
+            "AI Cover 여부를 분류합니다.\n"
+            "02_videos_meta.csv에 이미 있는 video_id는 건너뜁니다.\n"
+            "\n"
+            "입출력 파일은 모두 data/ 폴더를 기준으로 합니다."
+        )
+    )
+    parser.add_argument(
+        "--api-key", type=str, default=API_KEY,
+        help="YouTube Data API 키",
+    )
+    parser.add_argument(
+        "--input-uploads", type=str, default=DEFAULT_INPUT_UPLOADS,
+        help=f"채널 업로드 목록 CSV (기본값: {DEFAULT_INPUT_UPLOADS})",
+    )
+    parser.add_argument(
+        "--input-existing", type=str, default=DEFAULT_INPUT_EXISTING,
+        help=f"기존 수집 영상 CSV (기본값: {DEFAULT_INPUT_EXISTING}, 중복 방지용)",
+    )
+    parser.add_argument(
+        "--output", type=str, default=DEFAULT_OUTPUT,
+        help=f"출력 CSV (기본값: {DEFAULT_OUTPUT})",
+    )
+    parser.add_argument(
+        "--completed", type=str, default=DEFAULT_COMPLETED,
+        help=f"완료된 배치 기록 파일 (기본값: {DEFAULT_COMPLETED})",
+    )
+    parser.add_argument(
+        "--sleep-seconds", type=float, default=0.05,
+        help="API 요청 간 대기 시간(초) (기본값: 0.05)",
+    )
+    parser.add_argument(
+        "--reset", action="store_true", default=False,
+        help="처음부터 다시 수집 (기존 출력 파일 삭제)",
+    )
+    return parser.parse_args()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 입력값 검증
+# ═══════════════════════════════════════════════════════════════
+
+def validate_args(args: argparse.Namespace) -> None:
+    if not args.api_key or args.api_key == "여기에_API_키_입력":
+        raise ValueError(
+            "\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "❌ API 키가 설정되지 않았습니다.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "방법 1. 코드 상단 API_KEY 변수에 직접 입력:\n"
+            '  API_KEY = "AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"\n'
+            "\n"
+            "방법 2. 커맨드라인 인자로 전달:\n"
+            '  python 05_fetch_uploads_meta.py --api-key "AIzaSyXXXX..."\n'
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+    if not os.path.exists(args.input_uploads):
+        raise FileNotFoundError(
+            f"입력 파일을 찾을 수 없습니다: {args.input_uploads}\n"
+            "04_fetch_channel_uploads.py를 먼저 실행하세요."
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+# video_id 목록 준비
+# ═══════════════════════════════════════════════════════════════
+
+def load_target_video_ids(
+    uploads_path: str,
+    existing_path: str,
+) -> List[str]:
+    """
+    수집할 video_id 목록을 준비합니다.
+
+    04_channel_uploads.csv의 video_id 중에서
+    02_videos_meta.csv에 이미 있는 video_id를 제외합니다.
+
+    이미 있는 영상은 메타데이터가 있으므로 재수집 불필요 → 쿼터 절약
+    """
+    uploads_df = pd.read_csv(uploads_path, low_memory=False)
+    all_ids    = set(uploads_df['video_id'].dropna().astype(str).str.strip())
+
+    # 이미 수집된 video_id 로드
+    existing_ids: Set[str] = set()
+    if os.path.exists(existing_path):
+        existing_df  = pd.read_csv(existing_path, low_memory=False,
+                                   usecols=['video_id'])
+        existing_ids = set(existing_df['video_id'].dropna().astype(str).str.strip())
+
+    # 출력 파일에 이미 있는 video_id도 제외
+    output_path = DEFAULT_OUTPUT
+    if os.path.exists(output_path):
+        out_df       = pd.read_csv(output_path, low_memory=False,
+                                   usecols=['video_id'])
+        existing_ids |= set(out_df['video_id'].dropna().astype(str).str.strip())
+
+    new_ids = sorted(all_ids - existing_ids)
+
+    print(f"[INFO] 채널 업로드 총 video_id  : {len(all_ids):,}")
+    print(f"[INFO] 기존 수집 완료 video_id   : {len(existing_ids):,}")
+    print(f"[INFO] 신규 수집 대상 video_id   : {len(new_ids):,}")
+
+    # channel_id 매핑 보존
+    channel_map = dict(zip(
+        uploads_df['video_id'].astype(str).str.strip(),
+        uploads_df['channel_id'].astype(str).str.strip()
+    ))
+
+    return new_ids, channel_map
+
+
+# ═══════════════════════════════════════════════════════════════
+# 완료된 배치 관리
+# ═══════════════════════════════════════════════════════════════
+
+def load_completed_batches(filepath: str) -> Set[int]:
+    completed: Set[int] = set()
+    if not os.path.exists(filepath):
+        return completed
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            val = line.strip()
+            if val.isdigit():
+                completed.add(int(val))
+    return completed
+
+
+def mark_batch_completed(filepath: str, batch_idx: int) -> None:
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(f"{batch_idx}\n")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 파일 초기화
+# ═══════════════════════════════════════════════════════════════
+
+def reset_output_files(output_path: str, completed_path: str) -> None:
+    for path in [output_path, completed_path]:
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"[RESET] 삭제됨: {path}")
+
+
+def ensure_csv_header(output_path: str) -> None:
+    if os.path.exists(output_path):
+        return
+    os.makedirs(os.path.dirname(output_path), exist_ok=True) if os.path.dirname(output_path) else None
+    with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS)
+        writer.writeheader()
+
+
+# ═══════════════════════════════════════════════════════════════
+# AI Cover 분류
+# ═══════════════════════════════════════════════════════════════
+
+def classify_ai_cover(title: object, description: object, tags: object) -> int:
+    """
+    02_reclassify_ai_cover.py와 완전히 동일한 분류 로직.
+
+    Step 1. title(소문자)에 EXCLUDE 신호가 있으면 → 0
+            (description/tags의 'news', 'guide' 등은 무시)
+    Step 2. title + description + tags 전체(소문자)에서
+            INCLUDE 정규식 패턴 매칭 → 1
+    Step 3. INCLUDE 단순 문자열 포함 → 1
+    Step 4. 모두 해당 없으면 → 0
+
+    대소문자 무관 (.lower() 처리)
+    """
+    title_lower    = str(title).lower() if pd.notna(title) else ""
+    combined_lower = (
+        f"{title_lower} "
+        f"{str(description).lower() if pd.notna(description) else ''} "
+        f"{str(tags).lower() if pd.notna(tags) else ''}"
+    )
+
+    # Step 1: EXCLUDE (title에만)
+    for signal in EXCLUDE_SIGNALS_TITLE_ONLY:
+        if signal in title_lower:
+            return 0
+
+    # Step 2: 정규식 패턴 (전체 텍스트, 대소문자 무관)
+    for pattern in INCLUDE_PATTERNS_REGEX:
+        if re.search(pattern, combined_lower):
+            return 1
+
+    # Step 3: 단순 문자열 포함 (전체 텍스트)
+    for signal in INCLUDE_STRINGS:
+        if signal in combined_lower:
+            return 1
+
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# 주차 계산
+# ═══════════════════════════════════════════════════════════════
+
+def get_week_start_date(published_at: str) -> str:
+    try:
+        dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        week_start = dt - timedelta(days=dt.weekday())
+        return week_start.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def get_weeks_from_policy(published_at: str, policy_date: datetime) -> Optional[float]:
+    try:
+        dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        return round((dt - policy_date).days / 7, 2)
+    except Exception:
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# API 요청
+# ═══════════════════════════════════════════════════════════════
+
+def request_videos_batch(
+    api_key: str,
+    video_ids: List[str],
+    session: Optional[requests.Session] = None,
+) -> Dict:
+    """
+    videos.list API를 호출합니다.
+    snippet + contentDetails + statistics 수집.
+    """
+    params = {
+        "key":        api_key,
+        "part":       "snippet,contentDetails,statistics",
+        "id":         ",".join(video_ids),
+        "maxResults": len(video_ids),
+    }
+    requester = session or requests
+    response  = requester.get(API_URL, params=params, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 응답 파싱
+# ═══════════════════════════════════════════════════════════════
+
+def parse_duration(duration: str) -> Optional[int]:
+    if not duration:
+        return None
+    pattern = re.compile(
+        r"^P(?:(?P<days>\d+)D)?"
+        r"(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?$"
+    )
+    m = pattern.match(duration)
+    if not m:
+        return None
+    p = m.groupdict(default="0")
+    return (int(p["days"])*86400 + int(p["hours"])*3600 +
+            int(p["minutes"])*60 + int(p["seconds"]))
+
+
+def parse_video_items(
+    items: List[Dict],
+    channel_map: Dict[str, str],
+) -> List[Dict]:
+    """
+    videos.list 응답을 파싱합니다.
+
+    channel_map:
+      04_channel_uploads.csv에서 가져온 video_id → channel_id 매핑
+      API 응답의 channelId보다 이 값을 우선합니다.
+      (업로드 플레이리스트 기준 channel_id가 더 정확)
+    """
+    collected_at_utc = datetime.now(timezone.utc).isoformat()
+    rows: List[Dict] = []
+
+    for item in items:
+        video_id        = item.get("id", "")
+        snippet         = item.get("snippet", {}) or {}
+        content_details = item.get("contentDetails", {}) or {}
+        statistics      = item.get("statistics", {}) or {}
+
+        published_at = snippet.get("publishedAt", "")
+        title        = snippet.get("title", "")
+        description  = snippet.get("description", "")
+        tags_list    = snippet.get("tags", []) or []
+        tags         = " | ".join(str(t) for t in tags_list)
+
+        duration_sec = parse_duration(content_details.get("duration", ""))
+        view_count   = int(statistics.get("viewCount", 0) or 0)
+        like_count   = int(statistics.get("likeCount", 0) or 0)
+
+        is_ai_cover        = classify_ai_cover(title, description, tags)
+        week_start_date    = get_week_start_date(published_at)
+        weeks_from_policy1 = get_weeks_from_policy(published_at, POLICY1_DATE)
+        weeks_from_policy2 = get_weeks_from_policy(published_at, POLICY2_DATE)
+
+        # channel_id: 업로드 플레이리스트 기준 우선
+        channel_id = channel_map.get(video_id, snippet.get("channelId", ""))
+
+        rows.append({
+            "video_id":            video_id,
+            "channel_id":          channel_id,
+            "published_at":        published_at,
+            "video_title":         title,
+            "video_description":   description,
+            "video_tags":          tags,
+            "duration_sec":        duration_sec,
+            "view_count":          view_count,
+            "like_count":          like_count,
+            "is_ai_cover":         is_ai_cover,
+            "week_start_date":     week_start_date,
+            "weeks_from_policy1":  weeks_from_policy1,
+            "weeks_from_policy2":  weeks_from_policy2,
+            "collected_at_utc":    collected_at_utc,
+        })
+
+    return rows
+
+
+# ═══════════════════════════════════════════════════════════════
+# CSV 저장
+# ═══════════════════════════════════════════════════════════════
+
+def append_rows(output_path: str, rows: List[Dict]) -> int:
+    if not rows:
+        return 0
+    with open(output_path, "a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS)
+        writer.writerows(rows)
+    return len(rows)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 쿼터 초과 감지
+# ═══════════════════════════════════════════════════════════════
+
+def is_quota_exceeded(exc: requests.HTTPError) -> bool:
+    try:
+        text = exc.response.text.lower()
+    except Exception:
+        text = str(exc).lower()
+    return "quotaexceeded" in text
+
+
+# ═══════════════════════════════════════════════════════════════
+# 배치 생성
+# ═══════════════════════════════════════════════════════════════
+
+def make_batches(items: List[str], batch_size: int) -> List[List[str]]:
+    return [items[i:i+batch_size] for i in range(0, len(items), batch_size)]
+
+
+# ═══════════════════════════════════════════════════════════════
+# 메인 실행
+# ═══════════════════════════════════════════════════════════════
+
+def main() -> None:
+    args = parse_args()
+    validate_args(args)
+
+    if args.reset:
+        print("\n[RESET] 기존 파일을 삭제하고 처음부터 수집합니다.")
+        reset_output_files(args.output, args.completed)
+
+    # 수집 대상 video_id 로드
+    new_ids, channel_map = load_target_video_ids(
+        args.input_uploads,
+        args.input_existing,
+    )
+
+    if not new_ids:
+        print("\n[DONE] 수집할 신규 video_id가 없습니다.")
+        print("모든 영상이 이미 수집되어 있습니다.")
+        return
+
+    batches       = make_batches(new_ids, BATCH_SIZE)
+    total_batches = len(batches)
+
+    # 완료된 배치 로드
+    completed_batches = load_completed_batches(args.completed)
+
+    # CSV 헤더 초기화
+    ensure_csv_header(args.output)
+
+    pending_count = total_batches - len(completed_batches)
+
+    print(f"\n{'═'*65}")
+    print(f"  채널 업로드 메타데이터 수집 (videos.list)")
+    print(f"{'═'*65}")
+    print(f"  신규 video_id 수     : {len(new_ids):,}개")
+    print(f"  총 배치 수           : {total_batches:,}개 (배치당 {BATCH_SIZE}개)")
+    print(f"  이미 완료된 배치     : {len(completed_batches):,}개 → 건너뜀")
+    print(f"  이번에 수집할 배치   : {pending_count:,}개")
+    print(f"  예상 쿼터 소모       : {pending_count:,} units")
+    print(f"  입력 파일 (업로드)   : {args.input_uploads}")
+    print(f"  입력 파일 (기존)     : {args.input_existing}")
+    print(f"  출력 파일            : {args.output}")
+    print(f"  완료 기록 파일       : {args.completed}")
+    print(f"{'═'*65}\n")
+
+    # 수집 통계
+    total_requests  = 0
+    total_saved     = 0
+    total_missing   = 0
+    batches_skipped = 0
+    batches_done    = 0
+    batches_error   = 0
+    ai_cover_count  = 0
+
+    session = requests.Session()
+
+    try:
+        for batch_idx, batch_ids in enumerate(batches):
+
+            # ─────────────────────────────────────────────────
+            # 완료된 배치 건너뛰기 (API 요청 없음)
+            # ─────────────────────────────────────────────────
+            if batch_idx in completed_batches:
+                batches_skipped += 1
+                if batch_idx % 200 == 0:
+                    print(f"[BATCH {batch_idx+1:5d}/{total_batches}] ... (건너뜀)")
+                continue
+
+            batch_error = False
+
+            try:
+                data = request_videos_batch(
+                    api_key    = args.api_key,
+                    video_ids  = batch_ids,
+                    session    = session,
+                )
+                total_requests += 1
+
+            except requests.HTTPError as exc:
+                status = getattr(exc.response, "status_code", "unknown")
+                print(f"[BATCH {batch_idx+1:5d}] [ERROR] HTTP {status}")
+
+                if is_quota_exceeded(exc):
+                    print(
+                        "\n  [STOP] ❌ 쿼터 초과. 즉시 중단합니다.\n"
+                        "  내일 다시 실행하면 이 배치부터 이어서 수집됩니다."
+                    )
+                    raise
+
+                batch_error = True
+
+            except requests.RequestException as exc:
+                print(f"[BATCH {batch_idx+1:5d}] [ERROR] {exc}")
+                batch_error = True
+
+            if batch_error:
+                batches_error += 1
+                time.sleep(args.sleep_seconds)
+                continue
+
+            # ─────────────────────────────────────────────────
+            # 응답 파싱 및 저장
+            # ─────────────────────────────────────────────────
+            items        = data.get("items", [])
+            returned_ids = {item.get("id", "") for item in items}
+            missing_ids  = [vid for vid in batch_ids if vid not in returned_ids]
+            total_missing += len(missing_ids)
+
+            rows  = parse_video_items(items, channel_map)
+            saved = append_rows(args.output, rows)
+            total_saved    += saved
+            ai_cover_count += sum(1 for r in rows if r["is_ai_cover"] == 1)
+
+            # 500배치마다 진행상황 출력
+            if (batch_idx + 1) % 500 == 0 or batch_idx < 3:
+                print(
+                    f"[BATCH {batch_idx+1:5d}/{total_batches}] "
+                    f"saved={saved:3d} "
+                    f"missing={len(missing_ids):2d} "
+                    f"ai_cover={sum(1 for r in rows if r['is_ai_cover']==1):3d} "
+                    f"| 누적 {total_saved:,}개"
+                )
+
+            # ─────────────────────────────────────────────────
+            # 배치 완료 기록
+            # ─────────────────────────────────────────────────
+            mark_batch_completed(args.completed, batch_idx)
+            completed_batches.add(batch_idx)
+            batches_done += 1
+
+            time.sleep(args.sleep_seconds)
+
+    except requests.HTTPError:
+        pass
+
+    finally:
+        session.close()
+
+    # ─────────────────────────────────────────────────────────
+    # 최종 결과 출력
+    # ─────────────────────────────────────────────────────────
+    total_classified = total_saved
+    ai_rate = ai_cover_count / total_classified * 100 if total_classified > 0 else 0
+
+    print(f"\n{'═'*65}")
+    print(f"  수집 결과")
+    print(f"{'═'*65}")
+    print(f"  총 API 요청 수          : {total_requests:,}회")
+    print(f"  총 저장 행 수           : {total_saved:,}개")
+    print(f"  API 미반환 영상         : {total_missing:,}개 (삭제/비공개 등)")
+    print(f"  건너뛴 배치             : {batches_skipped:,}개 (이미 완료)")
+    print(f"  이번에 완료된 배치      : {batches_done:,}개")
+    print(f"  에러 배치               : {batches_error:,}개")
+    print(f"─{'─'*64}")
+    print(f"  is_ai_cover=1 (표본)    : {ai_cover_count:,}개 ({ai_rate:.1f}%)")
+    print(f"  is_ai_cover=0 (비표본)  : {total_saved-ai_cover_count:,}개")
+    print(f"  출력 파일               : {args.output}")
+    print(f"{'═'*65}")
+
+    remaining = total_batches - batches_skipped - batches_done
+    if remaining > 0:
+        print(
+            f"\n  ⚠️  아직 {remaining}개 배치가 남아있습니다.\n"
+            "  다시 실행하면 이어서 수집됩니다."
+        )
+    else:
+        print(
+            "\n  🎉 모든 배치 수집 완료!\n"
+            "\n  이제 분석에 필요한 모든 데이터가 준비됐습니다."
+            "\n"
+            "\n  분석에 사용할 파일:"
+            "\n    data/02_videos_meta.csv   → 표본 영상 메타데이터"
+            "\n    data/03_channels_meta.csv → 채널 메타데이터 (생성일 등)"
+            "\n    data/05_uploads_meta.csv  → 채널 전체 업로드 메타데이터"
+            "\n"
+            "\n  계산 가능한 핵심 지표:"
+            "\n    - 채널별 정책 전/후 AI Cover 업로드 수 변화"
+            "\n    - 채널 생존율 / 이탈율 / 전환율"
+            "\n    - heavy uploader 채널의 행동 변화"
+            "\n    - 풍선효과: 기존채널 감소 + 신규채널 증가 패턴\n"
+        )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(
+            "\n[STOPPED] 사용자에 의해 중단되었습니다.\n"
+            "현재 배치는 완료 기록되지 않았으므로\n"
+            "다시 실행하면 해당 배치부터 이어서 수집됩니다."
+        )
+        sys.exit(1)
+    except Exception as exc:
+        print(f"\n[FATAL] 예상치 못한 오류: {exc}")
+        sys.exit(1)
